@@ -4,7 +4,7 @@ AI steps (`ai.act`, `ai.verify`) in your Playwright tests — open source, visio
 
 ## Introduction
 
-`ai-wright` lets you include AI-powered actions, verifications, and data extraction in any Playwright test. It supports:
+`ai-wright` lets you include AI-native actions, verifications, and data extraction in any Playwright test. It supports:
 - BYOL (bring-your-own-license) to use your own [OpenAI](./src/llm-providers/openai.md), [Google Gemini](./src/llm-providers/gemini.md), or [Anthropic Claude](./src/llm-providers/claude.md) API keys.
 - or use your [TestChimp](https://testchimp.io) license key to avoid paying separately for token usage. 
 
@@ -96,6 +96,8 @@ import { test } from '@playwright/test';
 import { ai } from 'ai-wright';
 
 test('send message', async ({ page }) => {
+  await page.goto('https://studio--cafetime-afg2v.us-central1.hosted.app/');
+
   await ai.act('Log in with alice@example.com / TestPass123', { page, test });
 
   await ai.act('Open the Messages tab and send "Hello"', { page, test });
