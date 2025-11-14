@@ -39,6 +39,7 @@ export enum InteractionAction {
   BLUR = 'blur',
   SCROLL = 'scroll',
   SCROLL_INTO_VIEW = 'scrollIntoView',
+  WAIT_FOR = 'waitFor',
   
   // Navigation actions
   NAVIGATE = 'navigate',  // Go to URL (requires value field)
@@ -66,6 +67,7 @@ export interface SomCommand {
   modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift'>;
   delay?: number;         // Delay between keystrokes for TYPE (ms)
   timeout?: number;       // Override default timeout
+  durationSeconds?: number; // For waitFor action
 }
 
 export enum CommandRunStatus {
@@ -124,6 +126,7 @@ export interface TypedSelector {
   value: string;
   roleOptions?: { name?: string };  // For getByRole
   parent?: TypedSelector;  // For chaining: page.locator(parent).locator(this)
+  nth?: number;            // Optional index disambiguation when multiple nodes match
 }
 
 /**

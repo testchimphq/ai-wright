@@ -21,7 +21,8 @@ function debugLog(...messages: unknown[]): void {
 }
 
 const DEFAULT_LLM_TIMEOUT_MS = 120_000;
-const NAVIGATION_TIMEOUT_MS = 15_000;
+const NAVIGATION_TIMEOUT_MS = 30_000;
+const COMMAND_TIMEOUT_MS = 30_000;
 
 type AiClientRequest = LLMRequest;
 
@@ -149,6 +150,13 @@ function validateAiActionResult(payload: unknown): AiActionResult {
     result.needsRetryAfterPreActions = data.needsRetryAfterPreActions;
   }
 
+  if (data.stepCompleted !== undefined) {
+    if (typeof data.stepCompleted !== 'boolean') {
+      throw new Error('stepCompleted must be a boolean.');
+    }
+    result.stepCompleted = data.stepCompleted;
+  }
+
   if (data.confidence !== undefined) {
     if (typeof data.confidence !== 'number' || data.confidence < 0 || data.confidence > 100) {
       throw new Error('confidence must be a number between 0 and 100.');
@@ -183,6 +191,7 @@ export async function callAiAction(request: AiClientRequest): Promise<AiActionRe
       throw new Error('LLM provider returned an empty response.');
     }
     debugLog('Received LLM response', { provider: provider.name, length: content.length });
+    debugLog('LLM raw response content', content);
     return content;
   });
 
@@ -203,5 +212,5 @@ export function getNavigationTimeout(): number {
 }
 
 export function getCommandTimeout(): number {
-  return Math.max(parseTimeout(process.env.COMMAND_EXEC_TIMEOUT, 5_000), 0);
+  return Math.max(parseTimeout(process.env.COMMAND_EXEC_TIMEOUT, COMMAND_TIMEOUT_MS), 0);
 }

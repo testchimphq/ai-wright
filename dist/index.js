@@ -24,7 +24,60 @@ const DEFAULT_SCREENSHOT_QUALITY = 60;
 const DEFAULT_CONFIDENCE_THRESHOLD = 70;
 const DEFAULT_WAIT_RETRY_LIMIT = 2;
 const DEFAULT_OBJECTIVE_ITERATION_LIMIT = 5;
-const DEFAULT_TEST_TIMEOUT_MS = 180000;
+const DEFAULT_TEST_TIMEOUT_MS = 120000;
+const DEFAULT_PAGE_TIMEOUT_MS = 30000;
+const NAVIGATION_RETRY_DELAY_MS = 1000;
+const MIN_WAIT_FOR_DURATION_MS = 5000;
+const MAX_WAIT_FOR_DURATION_MS = 30000;
+function clampWaitDuration(seconds) {
+    const ms = seconds != null ? seconds * 1000 : MIN_WAIT_FOR_DURATION_MS;
+    return Math.min(Math.max(ms, MIN_WAIT_FOR_DURATION_MS), MAX_WAIT_FOR_DURATION_MS);
+}
+const testTimeoutStates = new WeakMap();
+const pageTimeoutStates = new WeakMap();
+function summarizeSomElement(element) {
+    const { somId, tag, role, text, ariaLabel, labelText, placeholder, name, type, id, className, bbox, hasVisiblePseudoElement, } = element;
+    return {
+        somId,
+        tag,
+        role,
+        text,
+        ariaLabel,
+        labelText,
+        placeholder,
+        name,
+        type,
+        id,
+        className,
+        bbox,
+        hasVisiblePseudoElement,
+    };
+}
+function logCommandSomContext(stage, command, handler) {
+    const payload = {
+        stage,
+        command,
+    };
+    if (command.elementRef) {
+        const somElement = handler.getSomElementById(command.elementRef);
+        payload.elementRef = command.elementRef;
+        if (somElement) {
+            payload.somElement = summarizeSomElement(somElement);
+        }
+        else {
+            payload.somElement = null;
+            payload.somElementMissing = true;
+        }
+    }
+    logDebug('ai.act command context', payload);
+}
+class NavigationInProgressError extends Error {
+    constructor(message, context) {
+        super(message);
+        this.name = 'NavigationInProgressError';
+        this.context = context;
+    }
+}
 function safeToString(value) {
     try {
         return String(value);
@@ -70,24 +123,122 @@ function getDesiredTestTimeout() {
     }
     return parsed >= 0 ? parsed : DEFAULT_TEST_TIMEOUT_MS;
 }
+function resolveStartTimeMs(candidate) {
+    if (!candidate) {
+        return undefined;
+    }
+    if (candidate instanceof Date) {
+        return candidate.getTime();
+    }
+    if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+        return candidate;
+    }
+    return undefined;
+}
+function getOrCreateTestTimeoutState(owner, context) {
+    let existing = testTimeoutStates.get(owner);
+    if (existing) {
+        return existing;
+    }
+    const startTimeFromInfo = resolveStartTimeMs(context.testInfo?.startTime);
+    const startTimeFromTest = resolveStartTimeMs(context.test?.info?.startTime);
+    const fallbackStart = Date.now();
+    const timeoutFromInfo = context.testInfo?.timeout;
+    const timeoutFromTest = typeof context.test?.timeout === 'function'
+        ? undefined
+        : context.test?.timeout;
+    const baseline = typeof timeoutFromInfo === 'number' && timeoutFromInfo > 0
+        ? timeoutFromInfo
+        : typeof timeoutFromTest === 'number' && timeoutFromTest > 0
+            ? timeoutFromTest
+            : DEFAULT_TEST_TIMEOUT_MS;
+    existing = {
+        baselineTimeoutMs: baseline,
+        startTimeMs: startTimeFromInfo ?? startTimeFromTest ?? fallbackStart,
+        lastAppliedTimeoutMs: baseline,
+    };
+    testTimeoutStates.set(owner, existing);
+    return existing;
+}
+function getOrCreatePageTimeoutState(page) {
+    let existing = pageTimeoutStates.get(page);
+    if (existing) {
+        return existing;
+    }
+    let baseline = DEFAULT_PAGE_TIMEOUT_MS;
+    try {
+        const timeoutSettings = page?._timeoutSettings;
+        const defaultTimeout = timeoutSettings?.timeout?.() ??
+            timeoutSettings?._timeout ??
+            (typeof page?.timeout === 'number' ? page.timeout : undefined);
+        if (typeof defaultTimeout === 'number' && defaultTimeout > 0) {
+            baseline = defaultTimeout;
+        }
+    }
+    catch {
+        // ignore – accessing Playwright internals is best-effort only
+    }
+    existing = {
+        baselineTimeoutMs: baseline,
+        startTimeMs: Date.now(),
+        lastAppliedTimeoutMs: baseline,
+    };
+    pageTimeoutStates.set(page, existing);
+    return existing;
+}
 function extendTestTimeout(context, reason) {
     const desired = getDesiredTestTimeout();
     if (desired <= 0) {
-        (0, ai_client_1.debugLog)('Skipping test timeout extension (desired <= 0)', { reason });
         return;
     }
-    const setter = resolveTimeoutSetter(context);
-    if (setter) {
-        (0, ai_client_1.debugLog)('Extending test timeout', { desired, reason });
+    // Try test.setTimeout() first (works in normal Playwright tests)
+    const setterInfo = resolveTimeoutSetter(context);
+    if (setterInfo) {
         try {
-            setter(desired);
+            const state = getOrCreateTestTimeoutState(setterInfo.owner, context);
+            const elapsedMs = Math.max(0, Date.now() - state.startTimeMs);
+            const nextTotal = Math.max(state.baselineTimeoutMs, elapsedMs + desired);
+            setterInfo.set(nextTotal);
+            state.lastAppliedTimeoutMs = nextTotal;
+            (0, ai_client_1.debugLog)('Extended test timeout via Playwright test context', {
+                reason,
+                desiredExtensionMs: desired,
+                elapsedMs,
+                newTimeoutBudgetMs: nextTotal,
+            });
+            return;
         }
         catch (error) {
-            (0, ai_client_1.debugLog)('Failed to extend test timeout', { error: error.message, desired, reason });
+            // Expected: "test.setTimeout() can only be called from a test"
+            // Fall through to page timeout fallback
+            (0, ai_client_1.debugLog)('test.setTimeout failed, using page timeout fallback', {
+                error: error instanceof Error ? error.message : String(error),
+                reason
+            });
         }
     }
-    else {
-        (0, ai_client_1.debugLog)('No test timeout setter available', { reason });
+    // Fallback: Set page timeout (works in runner-core VM context)
+    if (context.page?.setDefaultTimeout) {
+        try {
+            const state = getOrCreatePageTimeoutState(context.page);
+            const elapsedMs = Math.max(0, Date.now() - state.startTimeMs);
+            const nextTotal = Math.max(state.baselineTimeoutMs, elapsedMs + desired);
+            context.page.setDefaultTimeout(nextTotal);
+            context.page.setDefaultNavigationTimeout?.(nextTotal);
+            state.lastAppliedTimeoutMs = nextTotal;
+            (0, ai_client_1.debugLog)('Extended page timeouts for AI action', {
+                reason,
+                desiredExtensionMs: desired,
+                elapsedMs,
+                newTimeoutBudgetMs: nextTotal,
+            });
+        }
+        catch (error) {
+            (0, ai_client_1.debugLog)('page.setDefaultTimeout failed', {
+                error: error instanceof Error ? error.message : String(error),
+                reason
+            });
+        }
     }
 }
 function resolveTimeoutSetter(context) {
@@ -95,16 +246,16 @@ function resolveTimeoutSetter(context) {
     if (context.test) {
         const testObj = context.test;
         if (typeof testObj.setTimeout === 'function') {
-            candidates.push(testObj.setTimeout.bind(testObj));
+            candidates.push({ set: testObj.setTimeout.bind(testObj), owner: testObj });
         }
         else if (typeof testObj.timeout === 'function') {
-            candidates.push(testObj.timeout.bind(testObj));
+            candidates.push({ set: testObj.timeout.bind(testObj), owner: testObj });
         }
     }
     if (context.testInfo?.setTimeout) {
-        candidates.push(context.testInfo.setTimeout.bind(context.testInfo));
+        candidates.push({ set: context.testInfo.setTimeout.bind(context.testInfo), owner: context.testInfo });
     }
-    return candidates.find((fn) => typeof fn === 'function');
+    return candidates.find((info) => typeof info.set === 'function');
 }
 function resolveExpect(context) {
     if (context.expect) {
@@ -161,6 +312,9 @@ const ACT_PROTO_DEFINITION = [
     '  optional bool requiresFurtherAction = 6; // true when only partial progress was possible',
     '  optional string completedObjectiveSummary = 7; // summary of what the returned commands achieve',
     '  optional string nextObjective = 8; // remaining objective when requiresFurtherAction=true',
+    '  optional bool requestSomRefresh = 9; // set true to ask orchestrator for SoM refresh (commandsToRun must be empty)',
+    '  optional string somRefreshReason = 10;',
+    '  optional bool stepCompleted = 11; // set true when the objective is already satisfied (commandsToRun must be empty)',
     '}',
     'message SomCommand {',
     '  string elementRef = 1;  // e.g. "1"',
@@ -169,6 +323,7 @@ const ACT_PROTO_DEFINITION = [
     '  optional Coordinate coord = 4;      // coordinate click/press',
     '  optional Coordinate fromCoord = 5;  // drag start',
     '  optional Coordinate toCoord = 6;    // drag end',
+    '  optional double durationSeconds = 7; // for waitFor commands',
     '}',
     'message Coordinate {',
     '  double x = 1;',
@@ -183,6 +338,7 @@ function buildActRules(actions) {
         '- Output SomCommand objects ONLY. No plain-language narration, no Playwright code snippets.',
         '- Always target the SoM id that matches the marker in the screenshot (elementRef).',
         '- Prefer semantic actions (fill/select/click) on elementRef. Use coord/fromCoord/toCoord ONLY when elementRef cannot perform the action.',
+        '- Confirm the referenced elementRef exists in the SoM element map and appears ready before returning commands.',
         '- Drag-and-drop: supply both fromCoord and toCoord as percentages (0-100).',
         '- Buttons must use "click". Use "press" only for keyboard keys on focused inputs.',
         '- If text needs to be entered, include the fill action BEFORE submitting.',
@@ -190,7 +346,12 @@ function buildActRules(actions) {
         '- Only populate commandsToRun when the main objective can be executed immediately.',
         '- If you expect another LLM call after preCommands, set needsRetryAfterPreActions = true and leave commandsToRun empty.',
         '- If only part of the objective can be achieved now, return the commands for the completed portion, set requiresFurtherAction = true, provide completedObjectiveSummary, and specify nextObjective for the remaining work.',
+        '- Use requestSomRefresh = true when the SoM overlay needs to be regenerated (commandsToRun must be empty in that case).',
+        '- Use WAIT_FOR commands when additional time is required; provide durationSeconds or value in seconds.',
+        '- WAIT_FOR ignores elementRef; leave elementRef empty for pure waits.',
         '- Never hallucinate commands for screens you cannot currently see or interact with.',
+        '- When the objective is already satisfied, set stepCompleted = true, optionally describe the outcome in completedObjectiveSummary, and leave commandsToRun empty.',
+        '- commandsToRun may be empty ONLY when stepCompleted = true, shouldWait = true, or requestSomRefresh = true.',
         '- Do not include commandsToRun when needsRetryAfterPreActions = true or when shouldWait = true.',
         '- Do not include analysis, commentary, or verification commands outside the JSON structure.',
     ];
@@ -230,6 +391,73 @@ const EXTRACT_PROMPT_STATIC = [
     '- Populate extracted_content when returning a single value.',
     '',
 ];
+function isNavigationError(error) {
+    if (!error) {
+        return false;
+    }
+    const message = typeof error.message === 'string'
+        ? error.message
+        : typeof error === 'string'
+            ? error
+            : '';
+    if (!message) {
+        return false;
+    }
+    const patterns = [
+        'Execution context was destroyed',
+        'Target closed',
+        'Navigation failed because page crashed',
+        'Navigation failed because browser has disconnected',
+        'Most likely the page has been closed',
+    ];
+    return patterns.some((pattern) => message.includes(pattern));
+}
+async function stabilizeForLlm({ context, description, waitCount, waitRetryLimit, backoffMs, prepare, }) {
+    const page = context.page;
+    if (!page) {
+        throw new Error('Missing page instance for stabilization.');
+    }
+    let attemptsUsed = waitCount;
+    while (true) {
+        if (attemptsUsed > waitCount && backoffMs > 0) {
+            logDebug('Navigation detected, backing off before stabilization', {
+                description,
+                delayMs: backoffMs,
+                attemptsUsed,
+                waitRetryLimit,
+            });
+            await page.waitForTimeout(backoffMs);
+        }
+        logDebug('Waiting for page stability before LLM call', {
+            description,
+            attemptsUsed,
+            waitRetryLimit,
+        });
+        await (0, page_stability_1.waitForPageStability)(page, {
+            logger: context.logger,
+            description,
+        });
+        try {
+            const data = await prepare();
+            return { data, waitCount: attemptsUsed };
+        }
+        catch (error) {
+            if (isNavigationError(error)) {
+                attemptsUsed += 1;
+                if (attemptsUsed > waitRetryLimit) {
+                    throw new Error(`Navigation continued interrupting ${description} beyond retry limit (${waitRetryLimit}).`);
+                }
+                logDebug('Navigation interrupted preparation, retrying', {
+                    description,
+                    attemptsUsed,
+                    waitRetryLimit,
+                });
+                continue;
+            }
+            throw error;
+        }
+    }
+}
 function truncate(text, limit = SOM_ELEMENT_MAP_MAX_CHARS) {
     if (!text) {
         return text;
@@ -249,9 +477,10 @@ function buildActUserPrompt(objective, somElementMap, waitCount, maxWaits) {
         'Pre-action and wait instructions:',
         '- Place unexpected blockers (modals, banners, dialogs) in preCommands so they run before the main objective.',
         '- When the main objective still cannot run after those steps, set needsRetryAfterPreActions = true and leave commandsToRun empty so the agent re-queries.',
-        '- Use shouldWait = true only when the page is still loading and no actions should run yet; when shouldWait is true, both preCommands and commandsToRun must be empty.',
+        '- If the requested UI is not yet visible/interactable (page still loading, authentication pending, or SoM id absent), respond with shouldWait = true and do not return commandsToRun.',
         '- Provide waitReason to explain what you are waiting for when shouldWait = true.',
         '- When you supply commandsToRun, shouldWait must be false and needsRetryAfterPreActions must be false.',
+        '- When SoM markers appear stale or missing (duplicates, newly rendered panels, etc.), set requestSomRefresh = true (commandsToRun must remain empty) so the orchestrator can refresh the SoM map and re-prompt you.',
         `Wait context: wait_attempts_used = ${waitCount}, max_wait_attempts = ${maxWaits}.`,
         '',
         'Objective: ' + objective,
@@ -323,6 +552,12 @@ async function executeSomCommand(handler, command, timeoutMs) {
         if (!resolved && timeout) {
             clearTimeout(timeout);
         }
+        if (error instanceof som_handler_1.SomReannotationRequiredError) {
+            throw error;
+        }
+        if (isNavigationError(error)) {
+            throw new NavigationInProgressError(error.message, { command });
+        }
         return {
             failedAttempts: [
                 {
@@ -352,13 +587,22 @@ async function capturePageScreenshot(page, fullPage) {
 async function captureSomScreenshot(handler) {
     return handler.getScreenshot(true, false, DEFAULT_SCREENSHOT_QUALITY);
 }
-function ensureCommands(result) {
-    if (!result.commandsToRun || result.commandsToRun.length === 0) {
-        logDebug('LLM returned no commands to run', { result });
-        throw new Error('LLM did not return any commands to run.');
+function ensureCommands(result, onImplicitWait) {
+    if (result.requestSomRefresh || result.stepCompleted) {
+        return [];
     }
-    logDebug('LLM returned commands', { count: result.commandsToRun.length, commands: result.commandsToRun });
-    return result.commandsToRun;
+    const commands = result.commandsToRun || [];
+    if (commands.length === 0) {
+        logDebug('LLM returned empty commands without required flags; treating as implicit wait', {
+            shouldWait: result.shouldWait,
+            requestSomRefresh: result.requestSomRefresh,
+            stepCompleted: result.stepCompleted,
+        });
+        onImplicitWait();
+        return [];
+    }
+    logDebug('LLM returned commands', { count: commands.length, commands });
+    return commands;
 }
 function extractVerification(result) {
     if (result.verificationSuccess === undefined) {
@@ -438,21 +682,34 @@ async function act(objective, context) {
     let preActionRetryCount = 0;
     const aggregateResults = [];
     while (true) {
-        logDebug('Waiting for page stability before SoM capture', { waitCount, waitRetryLimit, preActionRetryCount });
-        await (0, page_stability_1.waitForPageStability)(context.page, {
-            logger: context.logger,
+        const stabilization = await stabilizeForLlm({
+            context,
             description: `ai.act objective: ${objective}`,
+            waitCount,
+            waitRetryLimit,
+            backoffMs: NAVIGATION_RETRY_DELAY_MS,
+            prepare: async () => {
+                await handler.updateSom(false);
+                const somMap = handler.getSomElementMap();
+                logDebug('SoM element map generated', { length: somMap.length });
+                const somScreenshot = await captureSomScreenshot(handler);
+                logDebug('Captured SoM screenshot', { bytes: somScreenshot.length });
+                return { somMap, somScreenshot };
+            },
         });
-        await handler.updateSom(false);
-        const somMap = handler.getSomElementMap();
-        logDebug('SoM element map generated', { length: somMap.length });
-        const somScreenshot = await captureSomScreenshot(handler);
-        logDebug('Captured SoM screenshot', { bytes: somScreenshot.length });
+        waitCount = stabilization.waitCount;
+        const { somMap, somScreenshot } = stabilization.data;
+        // Log before LLM call
+        logDebug('Calling LLM for AI action', { objective, waitCount, waitRetryLimit });
+        const llmCallStart = Date.now();
         const aiResult = await (0, ai_client_1.callAiAction)({
             systemPrompt: buildActSystemPrompt(),
             userPrompt: buildActUserPrompt(objective, somMap, waitCount, waitRetryLimit),
             image: somScreenshot,
         });
+        // Log after LLM call
+        const llmCallDuration = Date.now() - llmCallStart;
+        logDebug('LLM call completed', { durationMs: llmCallDuration, objective });
         logDebug('AI action result received', { aiResult });
         if (aiResult.shouldWait) {
             logDebug('LLM requested additional stabilization wait', {
@@ -474,10 +731,72 @@ async function act(objective, context) {
             waitCount += 1;
             continue;
         }
+        if (aiResult.stepCompleted) {
+            logDebug('LLM indicated step already satisfied', { objective });
+            const response = {
+                command_results: aggregateResults,
+                status: types_1.CommandRunStatus.SUCCESS,
+                error: undefined,
+            };
+            logDebug('ai.act completed', response);
+            return response;
+        }
+        if (aiResult.requestSomRefresh) {
+            if (aiResult.commandsToRun && aiResult.commandsToRun.length > 0) {
+                logDebug('LLM requested SoM refresh but also supplied commands; commands will be ignored', {
+                    commands: aiResult.commandsToRun,
+                });
+            }
+            logDebug('LLM requested SoM refresh before executing commands', {
+                reason: aiResult.somRefreshReason,
+                waitCount,
+                waitRetryLimit,
+            });
+            try {
+                await (0, page_stability_1.waitForPageStability)(context.page, {
+                    logger: context.logger,
+                    description: `SoM refresh for ai.act objective: ${objective}`,
+                });
+                const count = await handler.updateSom(false);
+                logDebug('SoM refreshed per LLM request', { elementCount: count });
+            }
+            catch (error) {
+                if (isNavigationError(error)) {
+                    logDebug('Navigation interrupted SoM refresh requested by LLM; retrying', {
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                    waitCount = Math.min(waitCount + 1, waitRetryLimit);
+                    preActionRetryCount = 0;
+                    continue;
+                }
+                throw error;
+            }
+            waitCount = Math.min(waitCount + 1, waitRetryLimit);
+            preActionRetryCount = 0;
+            continue;
+        }
         const preCommands = aiResult.preCommands ?? [];
         if (preCommands.length > 0) {
             logDebug('Executing pre-commands', { count: preCommands.length });
             for (const command of preCommands) {
+                if (command.action === types_1.InteractionAction.WAIT_FOR) {
+                    const durationMs = clampWaitDuration(command.durationSeconds ?? (command.value ? Number(command.value) : undefined));
+                    logDebug('Executing WAIT_FOR pre-command as timed wait', {
+                        durationMs,
+                        command,
+                    });
+                    await context.page.waitForTimeout(durationMs);
+                    aggregateResults.push({
+                        failedAttempts: [],
+                        successAttempt: {
+                            command: `await page.waitForTimeout(${durationMs})`,
+                            status: types_1.CommandRunStatus.SUCCESS,
+                        },
+                        status: types_1.CommandRunStatus.SUCCESS,
+                    });
+                    continue;
+                }
+                logCommandSomContext('preCommand', command, handler);
                 const timeout = isNavigationAction(command.action)
                     ? (0, ai_client_1.getNavigationTimeout)()
                     : (0, ai_client_1.getCommandTimeout)();
@@ -512,6 +831,21 @@ async function act(objective, context) {
                 logger: context.logger,
                 description: `post-preCommands for ai.act objective: ${objective}`,
             });
+            try {
+                const count = await handler.updateSom(false);
+                logDebug('SoM refreshed after pre-commands', { elementCount: count });
+            }
+            catch (error) {
+                if (isNavigationError(error)) {
+                    logDebug('Navigation interrupted SoM refresh after pre-commands; retrying', {
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                    waitCount = Math.min(waitCount + 1, waitRetryLimit);
+                    preActionRetryCount = 0;
+                    continue;
+                }
+                throw error;
+            }
         }
         if (aiResult.needsRetryAfterPreActions) {
             logDebug('LLM requested retry after pre-actions', {
@@ -530,15 +864,97 @@ async function act(objective, context) {
             waitCount = 0;
             continue;
         }
-        const commands = ensureCommands(aiResult);
+        let implicitWaitTriggered = false;
+        const commands = ensureCommands(aiResult, () => {
+            implicitWaitTriggered = true;
+        });
+        if (implicitWaitTriggered) {
+            if (waitCount >= waitRetryLimit) {
+                throw new Error(`LLM returned empty commands without allowed flags beyond max wait attempts (${waitRetryLimit}).`);
+            }
+            logDebug('Implicit wait triggered due to empty command list; re-running stabilization', {
+                waitCount,
+                waitRetryLimit,
+            });
+            waitCount += 1;
+            await (0, page_stability_1.waitForPageStability)(context.page, {
+                logger: context.logger,
+                description: `implicit-wait for ai.act objective: ${objective}`,
+            });
+            continue;
+        }
+        let navigationRetryRequested = false;
+        const waitCommands = commands.filter((command) => command.action === types_1.InteractionAction.WAIT_FOR);
+        const actionCommands = commands.filter((command) => command.action !== types_1.InteractionAction.WAIT_FOR);
+        if (waitCommands.length > 0 && actionCommands.length > 0) {
+            logDebug('WAIT_FOR command mixed with other actions; will execute waits first', {
+                waitCommands,
+                actionCommands,
+            });
+        }
+        for (const waitCommand of waitCommands) {
+            const durationMs = clampWaitDuration(waitCommand.durationSeconds ?? (waitCommand.value ? Number(waitCommand.value) : undefined));
+            logDebug('Executing WAIT_FOR command', { durationMs, command: waitCommand });
+            await context.page.waitForTimeout(durationMs);
+            await (0, page_stability_1.waitForPageStability)(context.page, {
+                logger: context.logger,
+                description: `post-waitFor for ai.act objective: ${objective}`,
+            });
+            try {
+                const count = await handler.updateSom(false);
+                logDebug('SoM refreshed after WAIT_FOR command', { elementCount: count });
+            }
+            catch (error) {
+                if (isNavigationError(error)) {
+                    logDebug('Navigation interrupted SoM refresh after WAIT_FOR; retrying', {
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                    navigationRetryRequested = true;
+                    break;
+                }
+                throw error;
+            }
+        }
+        if (navigationRetryRequested) {
+            aggregateResults.length = 0;
+            waitCount = Math.min(waitCount + 1, waitRetryLimit);
+            preActionRetryCount = 0;
+            continue;
+        }
+        const commandsToExecute = actionCommands;
         let status = types_1.CommandRunStatus.SUCCESS;
         let lastError;
         let failedCommand;
-        for (const command of commands) {
+        let reannotationRequested = false;
+        for (const command of commandsToExecute) {
+            logCommandSomContext('command', command, handler);
             const timeout = isNavigationAction(command.action)
                 ? (0, ai_client_1.getNavigationTimeout)()
                 : (0, ai_client_1.getCommandTimeout)();
-            const result = await executeSomCommand(handler, command, timeout);
+            let result;
+            try {
+                result = await executeSomCommand(handler, command, timeout);
+            }
+            catch (error) {
+                if (error instanceof som_handler_1.SomReannotationRequiredError) {
+                    logDebug('SoM target changed; refreshing map and re-prompting LLM', {
+                        command,
+                        reason: error.message,
+                        context: error.context,
+                    });
+                    reannotationRequested = true;
+                    break;
+                }
+                if (error instanceof NavigationInProgressError || isNavigationError(error)) {
+                    logDebug('Navigation interrupted command execution; refreshing map and retrying', {
+                        command,
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                    navigationRetryRequested = true;
+                    break;
+                }
+                throw error;
+            }
             logDebug('Executed command', {
                 command,
                 status: result.status,
@@ -551,12 +967,41 @@ async function act(objective, context) {
                 error: result.error,
             });
             aggregateResults.push(result);
+            try {
+                logDebug('Post-command stabilization before refreshing SoM', {
+                    objective,
+                    command,
+                });
+                await (0, page_stability_1.waitForPageStability)(context.page, {
+                    logger: context.logger,
+                    description: `post-command for ai.act objective: ${objective}`,
+                });
+                const count = await handler.updateSom(false);
+                logDebug('SoM refreshed after command', { elementCount: count });
+            }
+            catch (error) {
+                if (isNavigationError(error)) {
+                    logDebug('Navigation interrupted post-command SoM refresh; retrying', {
+                        command,
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                    navigationRetryRequested = true;
+                    break;
+                }
+                throw error;
+            }
             if (result.status === types_1.CommandRunStatus.FAILURE) {
                 status = types_1.CommandRunStatus.FAILURE;
                 lastError = result.error;
                 failedCommand = command;
                 break;
             }
+        }
+        if (reannotationRequested || navigationRetryRequested) {
+            aggregateResults.length = 0;
+            waitCount = Math.min(waitCount + 1, waitRetryLimit);
+            preActionRetryCount = 0;
+            continue;
         }
         const response = {
             command_results: aggregateResults,
@@ -585,28 +1030,77 @@ async function verify(requirement, context, options) {
     }
     logDebug('ai.verify invoked', { requirement });
     extendTestTimeout(context, 'ai.verify');
-    const screenshot = await capturePageScreenshot(context.page, true);
-    const aiResult = await (0, ai_client_1.callAiAction)({
-        systemPrompt: buildVerifySystemPrompt(),
-        userPrompt: buildVerifyUserPrompt(requirement),
-        image: screenshot,
-    });
-    const { verificationSuccess, confidence, verificationReason } = extractVerification(aiResult);
-    logDebug('ai.verify result from LLM', { verificationSuccess, confidence, verificationReason });
-    const threshold = Math.max(0, options?.confidence_threshold ?? DEFAULT_CONFIDENCE_THRESHOLD);
-    const expectFn = options?.expect ?? resolveExpect(context);
-    if (!expectFn) {
-        throw new Error('verify() requires Playwright expect. Pass the Playwright test object or provide expect explicitly.');
+    const waitRetryLimit = getMaxWaitRetries();
+    let waitCount = 0;
+    while (true) {
+        const stabilization = await stabilizeForLlm({
+            context,
+            description: `ai.verify requirement: ${requirement}`,
+            waitCount,
+            waitRetryLimit,
+            backoffMs: NAVIGATION_RETRY_DELAY_MS,
+            prepare: async () => capturePageScreenshot(context.page, true),
+        });
+        waitCount = stabilization.waitCount;
+        const screenshot = stabilization.data;
+        logDebug('Calling LLM for AI verification', { requirement });
+        const llmCallStart = Date.now();
+        let aiResult;
+        try {
+            aiResult = await (0, ai_client_1.callAiAction)({
+                systemPrompt: buildVerifySystemPrompt(),
+                userPrompt: buildVerifyUserPrompt(requirement),
+                image: screenshot,
+            });
+        }
+        catch (error) {
+            if (isNavigationError(error)) {
+                logDebug('Navigation interrupted verification LLM call; retrying after stabilization', {
+                    requirement,
+                });
+                waitCount = Math.min(waitCount + 1, waitRetryLimit);
+                if (waitCount > waitRetryLimit) {
+                    throw new Error(`Navigation continued interrupting verification for "${requirement}" beyond retry limit (${waitRetryLimit}).`);
+                }
+                continue;
+            }
+            throw error;
+        }
+        const llmCallDuration = Date.now() - llmCallStart;
+        logDebug('LLM call completed', { durationMs: llmCallDuration, requirement });
+        if (aiResult.requestSomRefresh) {
+            logDebug('LLM requested SoM refresh during verification; retrying', {
+                requirement,
+                reason: aiResult.somRefreshReason,
+                waitCount,
+                waitRetryLimit,
+            });
+            waitCount = Math.min(waitCount + 1, waitRetryLimit);
+            continue;
+        }
+        const { verificationSuccess, confidence, verificationReason } = extractVerification(aiResult);
+        logDebug('ai.verify result from LLM', { verificationSuccess, confidence, verificationReason });
+        if (aiResult.stepCompleted || verificationSuccess) {
+            logDebug('LLM indicated verification already satisfied', { requirement, verificationSuccess });
+            const response = { verificationSuccess, confidence, verificationReason };
+            logDebug('ai.verify completed', response);
+            return response;
+        }
+        const threshold = Math.max(0, options?.confidence_threshold ?? DEFAULT_CONFIDENCE_THRESHOLD);
+        const expectFn = options?.expect ?? resolveExpect(context);
+        if (!expectFn) {
+            throw new Error('verify() requires Playwright expect. Pass the Playwright test object or provide expect explicitly.');
+        }
+        if (!verificationSuccess && verificationReason) {
+            logDebug('ai.verify reported failure reason', { verificationReason });
+        }
+        logDebug('ai.verify asserting', { threshold });
+        expectFn(confidence, `AI verification confidence ${confidence} is below threshold ${threshold}`).toBeGreaterThanOrEqual(threshold);
+        expectFn(verificationSuccess, `AI verification failed for requirement: ${requirement}${verificationReason ? ` - ${verificationReason}` : ''}`).toBe(true);
+        const response = { verificationSuccess, confidence, verificationReason };
+        logDebug('ai.verify completed', response);
+        return response;
     }
-    if (!verificationSuccess && verificationReason) {
-        logDebug('ai.verify reported failure reason', { verificationReason });
-    }
-    logDebug('ai.verify asserting', { threshold });
-    expectFn(confidence, `AI verification confidence ${confidence} is below threshold ${threshold}`).toBeGreaterThanOrEqual(threshold);
-    expectFn(verificationSuccess, `AI verification failed for requirement: ${requirement}${verificationReason ? ` - ${verificationReason}` : ''}`).toBe(true);
-    const response = { verificationSuccess, confidence, verificationReason };
-    logDebug('ai.verify completed', response);
-    return response;
 }
 async function extract(requirement, context, options) {
     if (!context?.page) {

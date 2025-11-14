@@ -26,6 +26,7 @@ export declare enum InteractionAction {
     BLUR = "blur",
     SCROLL = "scroll",
     SCROLL_INTO_VIEW = "scrollIntoView",
+    WAIT_FOR = "waitFor",
     NAVIGATE = "navigate",// Go to URL (requires value field)
     GO_BACK = "goBack",
     GO_FORWARD = "goForward",
@@ -46,6 +47,7 @@ export interface SomCommand {
     modifiers?: Array<'Alt' | 'Control' | 'Meta' | 'Shift'>;
     delay?: number;
     timeout?: number;
+    durationSeconds?: number;
 }
 export declare enum CommandRunStatus {
     SUCCESS = "success",
@@ -105,6 +107,7 @@ export interface TypedSelector {
         name?: string;
     };
     parent?: TypedSelector;
+    nth?: number;
 }
 /**
  * Verification types for expect assertions

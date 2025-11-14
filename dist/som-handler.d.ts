@@ -2,9 +2,13 @@
  * PageSoMHandler - Set-of-Marks Handler for Visual Element Identification
  * Manages SoM markers, canvas overlay, and semantic command execution
  */
-import { SomCommand, SemanticCommandResult, SomVerification } from './som-types';
+import { SomCommand, SomElement, SemanticCommandResult, SomVerification } from './som-types';
 type PlaywrightExpect = typeof import('@playwright/test').expect;
 export declare function registerPlaywrightExpect(expectFn: PlaywrightExpect): void;
+export declare class SomReannotationRequiredError extends Error {
+    context?: Record<string, unknown>;
+    constructor(message: string, context?: Record<string, unknown>);
+}
 export declare class PageSoMHandler {
     private page;
     private somMap;
@@ -30,6 +34,11 @@ export declare class PageSoMHandler {
      * Returns concise, truncated element details to help disambiguate similar elements
      */
     getSomElementMap(): string;
+    /**
+     * Retrieve a SoM element by id for debugging/telemetry purposes
+     */
+    getSomElementById(somId: string | undefined | null): SomElement | undefined;
+    private resolveSomTarget;
     /**
      * Get screenshot with optional SoM markers
      */

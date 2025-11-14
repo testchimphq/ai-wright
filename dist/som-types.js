@@ -34,6 +34,7 @@ var InteractionAction;
     InteractionAction["BLUR"] = "blur";
     InteractionAction["SCROLL"] = "scroll";
     InteractionAction["SCROLL_INTO_VIEW"] = "scrollIntoView";
+    InteractionAction["WAIT_FOR"] = "waitFor";
     // Navigation actions
     InteractionAction["NAVIGATE"] = "navigate";
     InteractionAction["GO_BACK"] = "goBack";

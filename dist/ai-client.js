@@ -22,7 +22,8 @@ function debugLog(...messages) {
     }
 }
 const DEFAULT_LLM_TIMEOUT_MS = 120000;
-const NAVIGATION_TIMEOUT_MS = 15000;
+const NAVIGATION_TIMEOUT_MS = 30000;
+const COMMAND_TIMEOUT_MS = 30000;
 function parseTimeout(value, fallback) {
     if (!value) {
         return fallback;
@@ -131,6 +132,12 @@ function validateAiActionResult(payload) {
         }
         result.needsRetryAfterPreActions = data.needsRetryAfterPreActions;
     }
+    if (data.stepCompleted !== undefined) {
+        if (typeof data.stepCompleted !== 'boolean') {
+            throw new Error('stepCompleted must be a boolean.');
+        }
+        result.stepCompleted = data.stepCompleted;
+    }
     if (data.confidence !== undefined) {
         if (typeof data.confidence !== 'number' || data.confidence < 0 || data.confidence > 100) {
             throw new Error('confidence must be a number between 0 and 100.');
@@ -160,6 +167,7 @@ async function callAiAction(request) {
             throw new Error('LLM provider returned an empty response.');
         }
         debugLog('Received LLM response', { provider: provider.name, length: content.length });
+        debugLog('LLM raw response content', content);
         return content;
     });
     let parsed;
@@ -175,5 +183,5 @@ function getNavigationTimeout() {
     return Math.max(parseTimeout(process.env.NAVIGATION_COMMAND_TIMEOUT, NAVIGATION_TIMEOUT_MS), 0);
 }
 function getCommandTimeout() {
-    return Math.max(parseTimeout(process.env.COMMAND_EXEC_TIMEOUT, 5000), 0);
+    return Math.max(parseTimeout(process.env.COMMAND_EXEC_TIMEOUT, COMMAND_TIMEOUT_MS), 0);
 }

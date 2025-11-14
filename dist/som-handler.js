@@ -4,13 +4,21 @@
  * Manages SoM markers, canvas overlay, and semantic command execution
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PageSoMHandler = void 0;
+exports.PageSoMHandler = exports.SomReannotationRequiredError = void 0;
 exports.registerPlaywrightExpect = registerPlaywrightExpect;
 const som_types_1 = require("./som-types");
 let registeredExpect;
 function registerPlaywrightExpect(expectFn) {
     registeredExpect = expectFn;
 }
+class SomReannotationRequiredError extends Error {
+    constructor(message, context) {
+        super(message);
+        this.name = 'SomReannotationRequiredError';
+        this.context = context;
+    }
+}
+exports.SomReannotationRequiredError = SomReannotationRequiredError;
 function getExpect() {
     if (registeredExpect) {
         return registeredExpect;
@@ -410,7 +418,20 @@ class PageSoMHandler {
           pointer-events: none;
           display: none;
         `;
-                doc.body.appendChild(canvas);
+                // Re-check and wrap in try-catch to handle race condition
+                // (page might navigate between the check above and appendChild)
+                try {
+                    if (doc.body) {
+                        doc.body.appendChild(canvas);
+                    }
+                    else {
+                        return; // Body disappeared, abort
+                    }
+                }
+                catch (e) {
+                    // Page navigated during appendChild - ignore error
+                    return;
+                }
             }
             // Set canvas dimensions to viewport size
             canvas.width = window.innerWidth;
@@ -526,6 +547,119 @@ class PageSoMHandler {
             lines.push(`[${somId}]: ${parts.join(' ')}${attrStr}`);
         }
         return lines.join('\n');
+    }
+    /**
+     * Retrieve a SoM element by id for debugging/telemetry purposes
+     */
+    getSomElementById(somId) {
+        if (!somId) {
+            return undefined;
+        }
+        return this.somMap.get(somId);
+    }
+    async resolveSomTarget(elementRef, expected) {
+        const duplicates = await this.page.evaluate((ref) => {
+            const nodes = Array.from(document.querySelectorAll(`[tc-som-id="${ref}"]`));
+            return nodes.map((node, idx) => {
+                const rect = node.getBoundingClientRect();
+                return {
+                    index: idx,
+                    tag: node.tagName.toLowerCase(),
+                    className: node.className || '',
+                    text: (node.textContent || '').trim(),
+                    ariaLabel: node.getAttribute('aria-label') || '',
+                    bbox: {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                };
+            });
+        }, elementRef);
+        const duplicateCount = duplicates.length;
+        if (duplicateCount <= 1) {
+            return {
+                index: 0,
+                duplicateCount,
+                candidates: duplicates,
+            };
+        }
+        const expectedTag = (expected.tag || '').toLowerCase();
+        const expectedText = (expected.text || '').trim();
+        const expectedAria = (expected.ariaLabel || '').trim();
+        const expectedClassTokens = new Set((expected.className || '')
+            .split(/\s+/)
+            .map((token) => token.trim())
+            .filter(Boolean));
+        const expectedBBox = expected.bbox || { x: 0, y: 0, width: 0, height: 0 };
+        const scored = duplicates.map((candidate) => {
+            const candidateClassTokens = new Set(candidate.className
+                .split(/\s+/)
+                .map((token) => token.trim())
+                .filter(Boolean));
+            let score = 0;
+            if (candidate.tag === expectedTag && expectedTag) {
+                score += 5;
+            }
+            if (expectedClassTokens.size > 0) {
+                const hasAllClasses = Array.from(expectedClassTokens).every((cls) => candidateClassTokens.has(cls));
+                const overlap = Array.from(expectedClassTokens).some((cls) => candidateClassTokens.has(cls));
+                if (hasAllClasses) {
+                    score += 5;
+                }
+                else if (overlap) {
+                    score += 3;
+                }
+            }
+            const candidateText = candidate.text.trim();
+            if (expectedText) {
+                if (candidateText === expectedText) {
+                    score += 4;
+                }
+                else if (candidateText.includes(expectedText)) {
+                    score += 2;
+                }
+            }
+            const candidateAria = candidate.ariaLabel.trim();
+            if (expectedAria && candidateAria === expectedAria) {
+                score += 2;
+            }
+            const bbox = candidate.bbox;
+            if (expectedBBox.width && expectedBBox.height) {
+                const widthDiff = Math.abs(bbox.width - expectedBBox.width);
+                const heightDiff = Math.abs(bbox.height - expectedBBox.height);
+                if (widthDiff < 2 && heightDiff < 2) {
+                    score += 2;
+                }
+                else if (widthDiff < 6 && heightDiff < 6) {
+                    score += 1;
+                }
+            }
+            return { ...candidate, score };
+        });
+        let best = scored[0];
+        for (const candidate of scored) {
+            if (candidate.score > best.score ||
+                (candidate.score === best.score && candidate.index < best.index)) {
+                best = candidate;
+            }
+        }
+        if (!best || best.score <= 0) {
+            throw new SomReannotationRequiredError(`Duplicate SoM id "${elementRef}" no longer matches original element`, {
+                elementRef,
+                expected,
+                candidates: scored,
+            });
+        }
+        if (duplicateCount > 1) {
+            this.logger?.(`[PageSoMHandler] Resolved duplicate tc-som-id="${elementRef}" with ${duplicateCount} candidates (chosen index=${best.index}, score=${best.score})`, 'log');
+        }
+        return {
+            index: best.index,
+            duplicateCount,
+            candidates: scored,
+        };
     }
     /**
      * Get screenshot with optional SoM markers
@@ -658,6 +792,7 @@ class PageSoMHandler {
                 status: som_types_1.CommandRunStatus.FAILURE
             };
         }
+        const duplicateResolution = await this.resolveSomTarget(command.elementRef, element);
         this.logger?.(`[PageSoMHandler] Executing ${command.action} on element ${command.elementRef}`, 'log');
         // Clear mutations list before command execution
         this.mutationsList = [];
@@ -669,7 +804,8 @@ class PageSoMHandler {
         {
             const somIdSelector = {
                 type: 'locator',
-                value: `[tc-som-id="${command.elementRef}"]`
+                value: `[tc-som-id="${command.elementRef}"]`,
+                nth: duplicateResolution.index > 0 ? duplicateResolution.index : undefined,
             };
             this.logger?.(`[PageSoMHandler] Trying tc-som-id selector first: ${this.formatSelector(somIdSelector)}`, 'log');
             const modifiedCommand = element?.hasVisiblePseudoElement &&
@@ -1145,32 +1281,48 @@ class PageSoMHandler {
         const base = typedSelector.parent
             ? this.buildLocatorFromTypedSelector(typedSelector.parent)
             : this.page;
+        let locator;
         // Build locator from base
         switch (typedSelector.type) {
             case 'id':
-                return base.locator(`#${typedSelector.value}`);
+                locator = base.locator(`#${typedSelector.value}`);
+                break;
             case 'testId':
-                return base.getByTestId(typedSelector.value);
+                locator = base.getByTestId(typedSelector.value);
+                break;
             case 'label':
-                return base.getByLabel(typedSelector.value);
+                locator = base.getByLabel(typedSelector.value);
+                break;
             case 'role':
-                return base.getByRole(typedSelector.value, typedSelector.roleOptions);
+                locator = base.getByRole(typedSelector.value, typedSelector.roleOptions);
+                break;
             case 'placeholder':
-                return base.getByPlaceholder(typedSelector.value);
+                locator = base.getByPlaceholder(typedSelector.value);
+                break;
             case 'text':
-                return base.getByText(typedSelector.value);
+                locator = base.getByText(typedSelector.value);
+                break;
             case 'title':
-                return base.getByTitle(typedSelector.value);
+                locator = base.getByTitle(typedSelector.value);
+                break;
             case 'altText':
-                return base.getByAltText(typedSelector.value);
+                locator = base.getByAltText(typedSelector.value);
+                break;
             case 'name':
-                return base.locator(`[name="${typedSelector.value}"]`);
+                locator = base.locator(`[name="${typedSelector.value}"]`);
+                break;
             case 'locator':
                 // Generic locator - supports CSS, text=, has-text=, chaining, etc.
-                return base.locator(typedSelector.value);
+                locator = base.locator(typedSelector.value);
+                break;
             default:
                 throw new Error(`Unknown selector type: ${typedSelector.type}`);
         }
+        // Apply nth disambiguation when provided
+        if (typeof typedSelector.nth === 'number' && typedSelector.nth >= 0) {
+            return locator.nth(typedSelector.nth);
+        }
+        return locator;
     }
     /**
      * Format typed selector for logging (supports chaining)
@@ -1214,30 +1366,48 @@ class PageSoMHandler {
         // Add parent chain if exists (use .locator() for chaining)
         if (sel.parent) {
             const parentFormatted = this.formatSelector(sel.parent);
+            let combined;
             // Extract just the selector part for chaining
             switch (sel.type) {
                 case 'testId':
-                    return `${parentFormatted}.getByTestId('${sel.value}')`;
+                    combined = `${parentFormatted}.getByTestId('${sel.value}')`;
+                    break;
                 case 'label':
-                    return `${parentFormatted}.getByLabel('${sel.value}')`;
+                    combined = `${parentFormatted}.getByLabel('${sel.value}')`;
+                    break;
                 case 'role':
-                    return `${parentFormatted}.getByRole('${sel.value}', {name: '${sel.roleOptions?.name}'})`;
+                    combined = `${parentFormatted}.getByRole('${sel.value}', {name: '${sel.roleOptions?.name}'})`;
+                    break;
                 case 'placeholder':
-                    return `${parentFormatted}.getByPlaceholder('${sel.value}')`;
+                    combined = `${parentFormatted}.getByPlaceholder('${sel.value}')`;
+                    break;
                 case 'text':
-                    return `${parentFormatted}.getByText('${sel.value}')`;
+                    combined = `${parentFormatted}.getByText('${sel.value}')`;
+                    break;
                 case 'title':
-                    return `${parentFormatted}.getByTitle('${sel.value}')`;
+                    combined = `${parentFormatted}.getByTitle('${sel.value}')`;
+                    break;
                 case 'altText':
-                    return `${parentFormatted}.getByAltText('${sel.value}')`;
+                    combined = `${parentFormatted}.getByAltText('${sel.value}')`;
+                    break;
                 case 'id':
-                    return `${parentFormatted}.locator('#${sel.value}')`;
+                    combined = `${parentFormatted}.locator('#${sel.value}')`;
+                    break;
                 case 'name':
-                    return `${parentFormatted}.locator('[name="${sel.value}"]')`;
+                    combined = `${parentFormatted}.locator('[name="${sel.value}"]')`;
+                    break;
                 case 'locator':
                 default:
-                    return `${parentFormatted}.locator('${sel.value}')`;
+                    combined = `${parentFormatted}.locator('${sel.value}')`;
+                    break;
             }
+            if (typeof sel.nth === 'number' && sel.nth >= 0) {
+                combined = `${combined}.nth(${sel.nth})`;
+            }
+            return combined;
+        }
+        if (typeof sel.nth === 'number' && sel.nth >= 0) {
+            formatted = `${formatted}.nth(${sel.nth})`;
         }
         return formatted;
     }

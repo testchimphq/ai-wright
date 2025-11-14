@@ -6,6 +6,10 @@ type Logger = (message: string) => void;
 type TestLike = PlaywrightTestApi | {
     expect?: PlaywrightExpect;
     setTimeout?: (timeout: number) => void;
+    timeout?: number;
+    info?: {
+        startTime?: Date | number;
+    };
 };
 type ActContext = {
     page: Page;
@@ -15,6 +19,8 @@ type ActContext = {
     testInfo?: {
         setTimeout?: (timeout: number) => void;
         expect?: PlaywrightExpect;
+        timeout?: number;
+        startTime?: Date | number;
     };
 };
 type VerifyContext = {
@@ -24,6 +30,8 @@ type VerifyContext = {
     testInfo?: {
         setTimeout?: (timeout: number) => void;
         expect?: PlaywrightExpect;
+        timeout?: number;
+        startTime?: Date | number;
     };
 };
 type ExtractReturnType = 'string_array' | 'string' | 'int_array' | 'int';

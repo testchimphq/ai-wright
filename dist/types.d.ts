@@ -12,6 +12,9 @@ export interface AiActionResult {
     shouldWait?: boolean;
     waitReason?: string;
     needsRetryAfterPreActions?: boolean;
+    requestSomRefresh?: boolean;
+    somRefreshReason?: string;
+    stepCompleted?: boolean;
 }
 export interface AiActResult {
     command_results: SemanticCommandResult[];
