@@ -217,6 +217,10 @@ class PageSoMHandler {
                     }
                 }
             });
+            // Add canvas elements for canvas-based UI support
+            querySelectorAllDeep('canvas').forEach((canvas) => {
+                allInteractive.add(canvas);
+            });
             // Remove elements that are descendants of "true" interactive elements
             // (e.g., <span> inside <button> should not get separate marker)
             // But keep elements inside generic containers (div, section, etc.)
@@ -770,8 +774,10 @@ class PageSoMHandler {
                         if (!command.value) {
                             throw new Error('NAVIGATE action requires URL in value field');
                         }
-                        await this.page.goto(command.value, { waitUntil: 'networkidle', timeout: 30000 });
-                        playwrightCommand = `await page.goto('${command.value}')`;
+                        const url = command.value || '';
+                        const escapedUrl = this.escapeStringValue(url);
+                        await this.page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+                        playwrightCommand = `await page.goto('${escapedUrl}')`;
                         break;
                     case som_types_1.InteractionAction.GO_BACK:
                         await this.page.goBack({ waitUntil: 'networkidle', timeout: 30000 });
@@ -833,7 +839,33 @@ class PageSoMHandler {
                 };
             }
         }
-        // Lookup element in SoM map
+        // Lookup element in SoM map (do once, reuse below)
+        let element;
+        if (command.elementRef) {
+            element = this.somMap.get(command.elementRef);
+        }
+        // Handle canvas-relative coordinate commands
+        if (element && command.elementRelativeAbsoluteCoords) {
+            if (element.tag === 'canvas') {
+                this.logger?.(`[PageSoMHandler] Executing canvas-relative ${command.action} on canvas element ${command.elementRef} at coords (${command.elementRelativeAbsoluteCoords.x}, ${command.elementRelativeAbsoluteCoords.y})`, 'log');
+                try {
+                    const result = await this.executeCanvasRelativeAction(command, element);
+                    return result;
+                }
+                catch (error) {
+                    return {
+                        failedAttempts: [{
+                                command: `Canvas-relative action: ${command.action} on canvas ${command.elementRef} at (${command.elementRelativeAbsoluteCoords.x}, ${command.elementRelativeAbsoluteCoords.y})`,
+                                status: som_types_1.CommandRunStatus.FAILURE,
+                                error: error.message
+                            }],
+                        error: error.message,
+                        status: som_types_1.CommandRunStatus.FAILURE
+                    };
+                }
+            }
+        }
+        // For non-canvas commands, elementRef is required (coord-only commands handled above)
         if (!command.elementRef) {
             return {
                 failedAttempts: [],
@@ -841,7 +873,7 @@ class PageSoMHandler {
                 status: som_types_1.CommandRunStatus.FAILURE
             };
         }
-        const element = this.somMap.get(command.elementRef);
+        // Element lookup already done above - validate it exists
         if (!element) {
             return {
                 failedAttempts: [],
@@ -989,13 +1021,13 @@ class PageSoMHandler {
             // Generate Playwright command string FIRST (before executing, so we have it even if assertion fails)
             switch (verification.verificationType) {
                 case som_types_1.VerificationType.TEXT_CONTAINS:
-                    expectCommand = `await expect(${locatorStr}).toContainText('${verification.expected}')`;
+                    expectCommand = `await expect(${locatorStr}).toContainText('${this.escapeStringValue(String(verification.expected || ''))}')`;
                     break;
                 case som_types_1.VerificationType.TEXT_EQUALS:
-                    expectCommand = `await expect(${locatorStr}).toHaveText('${verification.expected}')`;
+                    expectCommand = `await expect(${locatorStr}).toHaveText('${this.escapeStringValue(String(verification.expected || ''))}')`;
                     break;
                 case som_types_1.VerificationType.VALUE_EQUALS:
-                    expectCommand = `await expect(${locatorStr}).toHaveValue('${verification.expected}')`;
+                    expectCommand = `await expect(${locatorStr}).toHaveValue('${this.escapeStringValue(String(verification.expected || ''))}')`;
                     break;
                 case som_types_1.VerificationType.VALUE_EMPTY:
                     expectCommand = `await expect(${locatorStr}).toHaveValue('')`;
@@ -1028,18 +1060,20 @@ class PageSoMHandler {
                     expectCommand = `expect(await ${locatorStr}.count()).toBeLessThan(${verification.expected})`;
                     break;
                 case som_types_1.VerificationType.HAS_CLASS:
-                    expectCommand = `await expect(${locatorStr}).toHaveClass(/${verification.expected}/)`;
+                    // Escape regex special characters for class name
+                    const escapedClass = this.escapeStringValue(String(verification.expected || '')).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    expectCommand = `await expect(${locatorStr}).toHaveClass(/${escapedClass}/)`;
                     break;
                 case som_types_1.VerificationType.HAS_ATTRIBUTE:
                     // Format: "attr:value" or just "attr" (use colon to avoid = in values)
                     const parts = verification.expected.split(':', 2);
                     const attr = parts[0];
-                    const value = parts[1];
-                    if (value) {
-                        expectCommand = `await expect(${locatorStr}).toHaveAttribute('${attr}', '${value}')`;
+                    const attrValue = parts[1];
+                    if (attrValue) {
+                        expectCommand = `await expect(${locatorStr}).toHaveAttribute('${this.escapeStringValue(attr)}', '${this.escapeStringValue(attrValue)}')`;
                     }
                     else {
-                        expectCommand = `await expect(${locatorStr}).toHaveAttribute('${attr}')`;
+                        expectCommand = `await expect(${locatorStr}).toHaveAttribute('${this.escapeStringValue(attr)}')`;
                     }
                     break;
                 default:
@@ -1151,6 +1185,15 @@ class PageSoMHandler {
         // - Dynamic markers (contains «)
         if (element.id && !element.id.includes(':') && !element.id.match(/^(rc_|__)/) && !element.id.includes('«')) {
             selectors.push({ type: 'id', value: element.id });
+        }
+        // Priority 2.5: Canvas elements - generate canvas locator
+        // Always prefer ID-based selector to avoid matching wrong canvas when multiple exist
+        if (element.tag === 'canvas') {
+            if (element.id) {
+                selectors.push({ type: 'locator', value: `canvas#${element.id}` });
+            }
+            // Note: For canvas without ID, we'll fall back to tc-som-id selector in executeCanvasRelativeAction
+            // to ensure we target the correct canvas element
         }
         // Priority 3: getByLabel (ONLY when there's an actual <label> element)
         // getByLabel doesn't work with aria-label/alt - it needs <label for="id">
@@ -1562,16 +1605,18 @@ class PageSoMHandler {
                     break;
                 case som_types_1.InteractionAction.FILL: {
                     const fillValue = value || '';
+                    const escapedFillValue = this.escapeStringValue(fillValue);
                     commandString = force
-                        ? `await ${selector}.fill('${fillValue}', { force: true, timeout: ${timeout} })`
-                        : `await ${selector}.fill('${fillValue}', { timeout: ${timeout} })`;
+                        ? `await ${selector}.fill('${escapedFillValue}', { force: true, timeout: ${timeout} })`
+                        : `await ${selector}.fill('${escapedFillValue}', { timeout: ${timeout} })`;
                     await locator.fill(fillValue, { force, timeout });
                     break;
                 }
                 case som_types_1.InteractionAction.TYPE: {
                     const typeValue = value || '';
+                    const escapedTypeValue = this.escapeStringValue(typeValue);
                     const delay = command.delay || 50;
-                    commandString = `await ${selector}.pressSequentially('${typeValue}', { delay: ${delay} })`;
+                    commandString = `await ${selector}.pressSequentially('${escapedTypeValue}', { delay: ${delay} })`;
                     await locator.pressSequentially(typeValue, { delay });
                     break;
                 }
@@ -1583,13 +1628,15 @@ class PageSoMHandler {
                     break;
                 case som_types_1.InteractionAction.PRESS: {
                     const pressKey = value || 'Enter';
-                    commandString = `await ${selector}.press('${pressKey}', { timeout: ${timeout} })`;
+                    const escapedKey = this.escapeStringValue(pressKey);
+                    commandString = `await ${selector}.press('${escapedKey}', { timeout: ${timeout} })`;
                     await locator.press(pressKey, { timeout });
                     break;
                 }
                 case som_types_1.InteractionAction.SELECT: {
                     const selectValue = value || '';
-                    commandString = `await ${selector}.selectOption('${selectValue}', { timeout: ${timeout} })`;
+                    const escapedSelectValue = this.escapeStringValue(selectValue);
+                    commandString = `await ${selector}.selectOption('${escapedSelectValue}', { timeout: ${timeout} })`;
                     await locator.selectOption(selectValue, { timeout });
                     break;
                 }
@@ -1649,6 +1696,163 @@ class PageSoMHandler {
         }
         catch (error) {
             error.playwrightCommand = commandString || `await ${selector}.${action}()`;
+            throw error;
+        }
+    }
+    /**
+     * Execute canvas-relative action using element-relative coordinates
+     */
+    async executeCanvasRelativeAction(command, element) {
+        if (!command.elementRelativeAbsoluteCoords) {
+            throw new Error('elementRelativeAbsoluteCoords is required for canvas-relative actions');
+        }
+        // Build canvas locator - prefer semantic selector if available, fallback to tc-som-id
+        const semanticSelectors = this.generateSemanticSelectors(element);
+        let canvasSelector;
+        if (semanticSelectors.length > 0 && semanticSelectors[0].type === 'locator') {
+            // Use semantic selector (e.g., canvas#id) for better readability
+            canvasSelector = semanticSelectors[0];
+        }
+        else {
+            // Fallback to tc-som-id selector
+            canvasSelector = {
+                type: 'locator',
+                value: `[tc-som-id="${command.elementRef}"]`,
+            };
+        }
+        const canvasLocator = this.buildLocatorFromTypedSelector(canvasSelector);
+        const selectorDesc = this.formatSelector(canvasSelector);
+        const { x, y } = command.elementRelativeAbsoluteCoords;
+        const timeout = command.timeout ?? ACTION_TIMEOUT_MS;
+        let playwrightCommand = '';
+        // Validate coordinates are reasonable (positive numbers)
+        if (typeof x !== 'number' || typeof y !== 'number' || x < 0 || y < 0 || !isFinite(x) || !isFinite(y)) {
+            throw new Error(`Invalid coordinates: x=${x}, y=${y}. Coordinates must be positive numbers.`);
+        }
+        // Log that we're about to execute canvas-relative action
+        this.logger?.(`[PageSoMHandler] Executing canvas-relative ${command.action} on ${selectorDesc} at position (${x}, ${y})`, 'log');
+        try {
+            switch (command.action) {
+                case som_types_1.InteractionAction.CLICK: {
+                    const button = command.button || 'left';
+                    const clickCount = command.clickCount || 1;
+                    const options = { position: { x, y }, timeout };
+                    if (command.force)
+                        options.force = true;
+                    if (button !== 'left')
+                        options.button = button;
+                    if (clickCount === 2) {
+                        playwrightCommand = `await ${selectorDesc}.dblclick({ position: { x: ${x}, y: ${y} }${command.force ? ', force: true' : ''}, timeout: ${timeout} })`;
+                        await canvasLocator.dblclick(options);
+                    }
+                    else {
+                        playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} }${button !== 'left' ? `, button: '${button}'` : ''}${command.force ? ', force: true' : ''}, timeout: ${timeout} })`;
+                        await canvasLocator.click(options);
+                    }
+                    break;
+                }
+                case som_types_1.InteractionAction.DOUBLE_CLICK: {
+                    const options = { position: { x, y }, timeout };
+                    if (command.force)
+                        options.force = true;
+                    playwrightCommand = `await ${selectorDesc}.dblclick({ position: { x: ${x}, y: ${y} }${command.force ? ', force: true' : ''}, timeout: ${timeout} })`;
+                    await canvasLocator.dblclick(options);
+                    break;
+                }
+                case som_types_1.InteractionAction.RIGHT_CLICK: {
+                    const options = { position: { x, y }, button: 'right', timeout };
+                    if (command.force)
+                        options.force = true;
+                    playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} }, button: 'right'${command.force ? ', force: true' : ''}, timeout: ${timeout} })`;
+                    await canvasLocator.click(options);
+                    break;
+                }
+                case som_types_1.InteractionAction.HOVER: {
+                    const options = { position: { x, y }, timeout };
+                    if (command.force)
+                        options.force = true;
+                    playwrightCommand = `await ${selectorDesc}.hover({ position: { x: ${x}, y: ${y} }${command.force ? ', force: true' : ''}, timeout: ${timeout} })`;
+                    await canvasLocator.hover(options);
+                    break;
+                }
+                case som_types_1.InteractionAction.FILL:
+                case som_types_1.InteractionAction.TYPE: {
+                    // Click first to focus, then type
+                    await canvasLocator.click({ position: { x, y }, timeout });
+                    await this.page.waitForTimeout(100); // Brief wait for focus
+                    const typeValue = command.value || '';
+                    const escapedValue = this.escapeStringValue(typeValue);
+                    if (command.action === som_types_1.InteractionAction.FILL) {
+                        playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} } }); await page.waitForTimeout(100); await page.keyboard.type('${escapedValue}')`;
+                        await this.page.keyboard.type(typeValue);
+                    }
+                    else {
+                        const delay = command.delay || 50;
+                        playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} } }); await page.waitForTimeout(100); await page.keyboard.type('${escapedValue}', { delay: ${delay} })`;
+                        await this.page.keyboard.type(typeValue, { delay });
+                    }
+                    break;
+                }
+                case som_types_1.InteractionAction.DRAG: {
+                    if (!command.toCoord || !command.elementRelativeAbsoluteCoords) {
+                        throw new Error('DRAG action requires both elementRelativeAbsoluteCoords (from position) and toCoord (to position) relative to canvas');
+                    }
+                    // toCoord should also be relative to canvas element (pixel coordinates)
+                    const toX = command.toCoord.x;
+                    const toY = command.toCoord.y;
+                    playwrightCommand = `await ${selectorDesc}.hover({ position: { x: ${x}, y: ${y} } }); await page.mouse.down(); await ${selectorDesc}.hover({ position: { x: ${toX}, y: ${toY} } }); await page.mouse.up()`;
+                    await canvasLocator.hover({ position: { x, y }, timeout });
+                    await this.page.mouse.down();
+                    await canvasLocator.hover({ position: { x: toX, y: toY }, timeout });
+                    await this.page.mouse.up();
+                    break;
+                }
+                case som_types_1.InteractionAction.CLEAR: {
+                    // Clear action on canvas - click and clear with keyboard
+                    await canvasLocator.click({ position: { x, y }, timeout });
+                    await this.page.waitForTimeout(100);
+                    await this.page.keyboard.press('Control+A');
+                    await this.page.keyboard.press('Delete');
+                    playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} } }); await page.waitForTimeout(100); await page.keyboard.press('Control+A'); await page.keyboard.press('Delete')`;
+                    break;
+                }
+                case som_types_1.InteractionAction.PRESS: {
+                    // Press key at canvas position - click first to focus
+                    await canvasLocator.click({ position: { x, y }, timeout });
+                    await this.page.waitForTimeout(100);
+                    const pressKey = command.value || 'Enter';
+                    const escapedKey = this.escapeStringValue(pressKey);
+                    await this.page.keyboard.press(pressKey);
+                    playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} } }); await page.waitForTimeout(100); await page.keyboard.press('${escapedKey}')`;
+                    break;
+                }
+                case som_types_1.InteractionAction.SCROLL: {
+                    // Scroll within canvas at position
+                    if (command.scrollAmount) {
+                        await canvasLocator.click({ position: { x, y }, timeout });
+                        await this.page.waitForTimeout(100);
+                        await this.page.keyboard.press(command.scrollDirection === 'down' ? 'ArrowDown' : 'ArrowUp', { delay: 50 });
+                        playwrightCommand = `await ${selectorDesc}.click({ position: { x: ${x}, y: ${y} } }); await page.keyboard.press('${command.scrollDirection === 'down' ? 'ArrowDown' : 'ArrowUp'}')`;
+                    }
+                    break;
+                }
+                default:
+                    throw new Error(`Canvas-relative action not supported for: ${command.action}. Actions like SELECT, CHECK, UNCHECK are not applicable to canvas elements.`);
+            }
+            // Log the command string after building it but before execution
+            this.logger?.(`[PageSoMHandler] Executing: ${playwrightCommand}`, 'log');
+            return {
+                failedAttempts: [],
+                successAttempt: {
+                    command: playwrightCommand,
+                    status: som_types_1.CommandRunStatus.SUCCESS
+                },
+                status: som_types_1.CommandRunStatus.SUCCESS
+            };
+        }
+        catch (error) {
+            const errorCommand = playwrightCommand || `Canvas-relative ${command.action} on canvas ${command.elementRef}`;
+            error.playwrightCommand = errorCommand;
             throw error;
         }
     }
@@ -1720,13 +1924,15 @@ class PageSoMHandler {
                     // Click to focus, then type
                     await this.page.mouse.click(pixelX, pixelY);
                     await this.page.waitForTimeout(100); // Brief wait for focus
+                    const typeValue = value || '';
                     if (action === som_types_1.InteractionAction.FILL) {
-                        await this.page.keyboard.type(value || '');
+                        await this.page.keyboard.type(typeValue);
                     }
                     else {
-                        await this.page.keyboard.type(value || '', { delay: command.delay || 50 });
+                        await this.page.keyboard.type(typeValue, { delay: command.delay || 50 });
                     }
-                    playwrightCommand = `await page.mouse.click(${pixelX}, ${pixelY}); await page.keyboard.type('${value}')`;
+                    const escapedTypeValue = this.escapeStringValue(typeValue);
+                    playwrightCommand = `await page.mouse.click(${pixelX}, ${pixelY}); await page.keyboard.type('${escapedTypeValue}')`;
                     break;
                 case som_types_1.InteractionAction.HOVER:
                     await this.page.mouse.move(pixelX, pixelY);
@@ -1785,13 +1991,15 @@ class PageSoMHandler {
                 case som_types_1.InteractionAction.TYPE:
                     // Click first, then type
                     await this.page.mouse.click(centerX, centerY);
+                    const typeValue = value || '';
                     if (action === som_types_1.InteractionAction.FILL) {
-                        await this.page.keyboard.type(value || '');
+                        await this.page.keyboard.type(typeValue);
                     }
                     else {
-                        await this.page.keyboard.type(value || '', { delay: command.delay || 50 });
+                        await this.page.keyboard.type(typeValue, { delay: command.delay || 50 });
                     }
-                    playwrightCommand = `await page.mouse.click(${centerX}, ${centerY}); await page.keyboard.type('${value}')`;
+                    const escapedTypeValue = this.escapeStringValue(typeValue);
+                    playwrightCommand = `await page.mouse.click(${centerX}, ${centerY}); await page.keyboard.type('${escapedTypeValue}')`;
                     break;
                 case som_types_1.InteractionAction.HOVER:
                     await this.page.mouse.move(centerX, centerY);
@@ -1877,6 +2085,21 @@ class PageSoMHandler {
      */
     escapeSelector(text) {
         return text.replace(/'/g, "\\'").trim().substring(0, 50);
+    }
+    /**
+     * Escape string value for use in JavaScript string literals (single-quoted)
+     * Handles quotes, backslashes, newlines, and other special characters
+     */
+    escapeStringValue(value) {
+        if (value == null) {
+            return '';
+        }
+        return String(value)
+            .replace(/\\/g, '\\\\') // Escape backslashes first
+            .replace(/'/g, "\\'") // Escape single quotes
+            .replace(/\n/g, '\\n') // Escape newlines
+            .replace(/\r/g, '\\r') // Escape carriage returns
+            .replace(/\t/g, '\\t'); // Escape tabs
     }
     /**
      * Try refined selector with parent scoping

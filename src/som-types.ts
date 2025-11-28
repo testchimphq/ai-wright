@@ -4,8 +4,8 @@
  */
 
 export interface Coordinate {
-  x: number;  // Percentage of viewport width: 0-100 (use 3 decimal precision, e.g., 15.625)
-  y: number;  // Percentage of viewport height: 0-100 (use 3 decimal precision, e.g., 82.375)
+  x: number;  // When used in coord: percentage of viewport width (0-100). When used in elementRelativeAbsoluteCoords: absolute pixels from element top-left.
+  y: number;  // When used in coord: percentage of viewport height (0-100). When used in elementRelativeAbsoluteCoords: absolute pixels from element top-left.
 }
 
 export enum InteractionAction {
@@ -54,7 +54,7 @@ export interface SomCommand {
   
   // Coordinate-based action (use when elementRef is empty/null)
   coord?: Coordinate;     // Percentage-based (x: 0-100, y: 0-100 of viewport)
-  
+  elementRelativeAbsoluteCoords?: Coordinate;  // Pixel coordinates (x, y) relative to top-left of element referenced by elementRef. Use only when elementRef points to a canvas element for interactions within the canvas.
   // Action-specific parameters
   value?: string;         // For fill/type/select/press actions
   fromCoord?: Coordinate; // For drag (start) - percentage-based

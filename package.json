@@ -1,6 +1,6 @@
 {
   "name": "ai-wright",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "AI-steps in your Playwright scripts",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

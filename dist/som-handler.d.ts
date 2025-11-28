@@ -87,6 +87,10 @@ export declare class PageSoMHandler {
      */
     private executeActionOnLocator;
     /**
+     * Execute canvas-relative action using element-relative coordinates
+     */
+    private executeCanvasRelativeAction;
+    /**
      * Execute coordinate-based action as fallback
      */
     /**
@@ -115,6 +119,11 @@ export declare class PageSoMHandler {
      * Escape selector text
      */
     private escapeSelector;
+    /**
+     * Escape string value for use in JavaScript string literals (single-quoted)
+     * Handles quotes, backslashes, newlines, and other special characters
+     */
+    private escapeStringValue;
     /**
      * Try refined selector with parent scoping
      */

@@ -36,6 +36,7 @@ export interface SomCommand {
     elementRef?: string;
     action: InteractionAction;
     coord?: Coordinate;
+    elementRelativeAbsoluteCoords?: Coordinate;
     value?: string;
     fromCoord?: Coordinate;
     toCoord?: Coordinate;

@@ -299,6 +299,7 @@ const ACT_PROMPT_HEADER = [
     '- Labels regenerate each run. Never rely on previous IDs.',
     '- When labels overlap: identify nearby IDs visually, then consult the element map to disambiguate.',
     '- Element map entries describe tag/text/aria attributes. Use them to pick the correct elementRef.',
+    '- Canvas elements (tag="canvas") represent entire canvas surfaces. To interact with elements drawn inside a canvas, use elementRef pointing to the canvas and elementRelativeAbsoluteCoords for pixel coordinates within the canvas.',
     '- Always prefer elementRef interactions. Use coord/fromCoord/toCoord only if elementRef cannot perform the action.',
 ];
 const ACT_PROTO_DEFINITION = [
@@ -324,6 +325,7 @@ const ACT_PROTO_DEFINITION = [
     '  optional Coordinate fromCoord = 5;  // drag start',
     '  optional Coordinate toCoord = 6;    // drag end',
     '  optional double durationSeconds = 7; // for waitFor commands',
+    '  optional Coordinate elementRelativeAbsoluteCoords = 8; // pixel coordinates relative to elementRef (for canvas interactions)',
     '}',
     'message Coordinate {',
     '  double x = 1;',
@@ -338,6 +340,8 @@ function buildActRules(actions) {
         '- Output SomCommand objects ONLY. No plain-language narration, no Playwright code snippets.',
         '- Always target the SoM id that matches the marker in the screenshot (elementRef).',
         '- Prefer semantic actions (fill/select/click) on elementRef. Use coord/fromCoord/toCoord ONLY when elementRef cannot perform the action.',
+        '- For canvas elements (tag="canvas" in element map): when interacting with elements drawn inside the canvas, use elementRef pointing to the canvas element AND elementRelativeAbsoluteCoords with pixel coordinates (x, y) from the canvas top-left corner.',
+        '- elementRelativeAbsoluteCoords contains absolute pixel values, not percentages. Use this ONLY when elementRef points to a canvas element.',
         '- Confirm the referenced elementRef exists in the SoM element map and appears ready before returning commands.',
         '- Drag-and-drop: supply both fromCoord and toCoord as percentages (0-100).',
         '- Buttons must use "click". Use "press" only for keyboard keys on focused inputs.',
